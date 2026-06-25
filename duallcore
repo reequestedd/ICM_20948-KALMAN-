@@ -582,6 +582,16 @@ void MqttTaskHandler(void *parameters){
     payload += "\"bse\":" + String(sensor.bse) + ",";
     payload += "\"fuse\":" + String(sensor.fuse) + ",";
     payload += "\"statusbit\":" + String(sensor.statusbit) + ",";
+    // payload += "\"roll\":"    + String(imu.roll,2)  + ",";
+    // payload += "\"pitch\":"   + String(imu.pitch,2) + ",";
+    // payload += "\"yaw\":"     + String(imu.yaw,2)   + ",";
+    payload += "\"lat\":"     + String("-7.7656")  + ",";
+    payload += "\"lng\":"     + String("110.3727")  + ",";
+    payload += "\"speed\":"   + String("0") + ",";
+    payload += "\"heading\":" + String("270") + ",";
+    payload += "\"altitude\":" + String("115") + ",";
+    payload += "\"fuse\":"    + String(sensor.fuse) + ",";
+    payload += "\"statusbit\":" + String(sensor.statusbit);
     payload += "\"rpm_rl\":" + String(sensor.rpmRL) + ",";
     payload += "\"rpm_rr\":" + String(sensor.rpmRR) + ",";
     payload += "\"sus_travel_rl\":" + String(sensor.susTravelRL) + ",";
@@ -623,14 +633,14 @@ void setup() {
   SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
   delay(100);
 
-  xTaskCreatePinnedToCore(NextionTaskHandler, "Nextion", 10000, NULL, 3, &nextion, 0);
-  xTaskCreatePinnedToCore(MqttTaskHandler, "Telem", 10000, NULL, 2, &telem, 1);
-
   Can0.onReceive(onReceive);
   Can0.setRX(CAN_RX);
   Can0.setTX(CAN_TX); 
   Can0.begin();
   Can0.setBaudRate(500000);
+
+  xTaskCreatePinnedToCore(NextionTaskHandler, "Nextion", 10000, NULL, 3, &nextion, 0);
+  xTaskCreatePinnedToCore(MqttTaskHandler, "Telem", 10000, NULL, 2, &telem, 1);
  
   // randomSeed(micros());
 
