@@ -551,7 +551,7 @@ void MqttTaskHandler(void *parameters){
 
   if(!setupModemNetwork()) {
     SerialMon.println("Setup network gagal. Restart ESP32.");
-    delay(5000);
+    vTaskDelay(pdMS_TO_TICKS(5000));
     ESP.restart(); // Otomatis restart jika gagal
   }
 
