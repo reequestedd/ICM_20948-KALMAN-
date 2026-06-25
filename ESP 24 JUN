@@ -577,9 +577,11 @@ void loop() {
   mqtt.loop();
 
   unsigned long currentMillis = millis();
-      String payload = "{";
+    String payload = "{";
     payload += "\"apps\":" + String(sensor.apps) + ",";
     payload += "\"bse\":" + String(sensor.bse) + ",";
+    payload += "\"fuse\":" + String(sensor.fuse) + ",";
+    payload += "\"statusbit\":" + String(sensor.statusbit) + ",";
     payload += "\"rpm_rl\":" + String(sensor.rpmRL) + ",";
     payload += "\"rpm_rr\":" + String(sensor.rpmRR) + ",";
     payload += "\"sus_travel_rl\":" + String(sensor.susTravelRL) + ",";
