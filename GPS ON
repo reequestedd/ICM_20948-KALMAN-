@@ -1,0 +1,836 @@
+#include <ESP32_CAN.h>
+#include <PubSubClient.h>
+
+// DEFFINE MODEM
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_RX_BUFFER 1024
+#include <TinyGsmClient.h> // Pindah ke sini setelah define modem
+#include <TinyGPS++.h>
+
+#define SerialMon Serial
+#define SerialAT  Serial1
+#define NEXTION_SERIAL Serial2
+
+#define NEXTION_RX 26
+#define NEXTION_TX 27
+
+#define MODEM_RX 23
+#define MODEM_TX 22
+// #define MODEM_PWRKEY 4 
+
+#define CAN_RX 5
+#define CAN_TX 4
+#define ID_NEXTION 0x13
+
+ESP32_CAN<RX_SIZE_256, TX_SIZE_16> Can0;
+
+// APN SIM Telkomsel
+const char apn[]      = "internet";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+int valRand;
+// Konfigurasi MQTT HiveMQ Cloud
+const char* mqttServer   = "broker.hivemq.com";
+const int   mqttPort     = 1883; // Port Non-TLS, tapi di dashboard broker pake WebSocket Port
+// const char* mqtt_user     = "";
+// const char* mqtt_password = "Zachrain1";
+const char* mqttTopic    = "arjuna/data";
+const char* mqttClientId = "testingvcu"; // topik bebas
+
+uint32_t lastNextionUpdate = 0;
+uint32_t lastTXupdate = 0;
+const uint16_t NEXTION_UPDATE_INTERVAL = 10; // Update layar setiap 10ms
+const uint16_t delayTX = 20;
+uint32_t lastCmdTime = 0;
+const uint16_t CmdTime = 3000;
+
+uint8_t fuseVal = 0xFF; 
+bool cmdPending = false;
+
+uint32_t lastMqttPublish = 0;
+const uint16_t MQTT_PUBLISH_INTERVAL = 100; 
+
+uint32_t lastGpsPoll = 0;
+const uint16_t GPS_INTERVAL = 500; // 10 Hz
+
+TinyGPSPlus gps;
+TinyGsm modem(SerialAT);
+TinyGsmClient gsmClient(modem);
+PubSubClient mqtt(gsmClient);
+
+// ================= STRUKTUR DATA CAN =================
+uint16_t kph;
+float print_arusHV;
+float print_teganganHV;
+float print_tempHVA;
+float print_tempHVB;
+float print_tempHV;
+
+struct RSMSensorData{
+  uint8_t  regID;         
+  uint8_t  susTravelRR;   
+  uint8_t  susTravelRL;
+  uint8_t susTraveFR;
+  uint8_t susTraveFL;
+  uint8_t  rpmRL_lsb;   
+  uint8_t  rpmRL_msb; 
+  int16_t rpmRL;        
+  uint8_t  rpmRR_lsb;   
+  uint8_t  rpmRR_msb;    
+  int16_t rpmRR; 
+  int8_t apps;
+  int8_t bse;
+  int16_t rpmbamo;
+  int16_t rpm;
+  uint8_t statusbit;
+  uint8_t fuse;
+  uint16_t currentLV;
+  uint16_t voltageLV;
+  uint8_t currentLV_msb;
+  uint8_t voltageLV_msb;
+  uint8_t currentLV_lsb;
+  uint8_t voltageLV_lsb;
+  int8_t tempRSM;
+};
+RSMSensorData sensor;
+
+struct Motor{
+  uint8_t suhuMotor;
+  uint8_t suhuIGBT;
+  uint16_t tegangan;
+  uint16_t arus;
+  uint16_t errorBAMO;
+  uint16_t kw;
+};
+Motor motor;
+
+struct BMSData{
+  uint8_t regID;
+  int8_t currentHVRatusan;
+  int8_t currentHVPuluhan;
+  uint16_t currentHV;
+  int avgTemp_A;
+  int avgTemp_B;
+  int tempHVBat;
+  int voltage_A;
+  int voltage_B;
+  int voltageHVBat;
+  uint32_t vtotalHVA;
+  uint32_t vtotalHVB;
+  uint32_t vtotalHV;
+}; 
+BMSData bms;
+
+struct IMUData{
+  float ax;
+  float ay;
+  float az;
+  float gx;
+  float gy;
+  float gz;
+  float mx;
+  float my;
+  float mz;
+  float roll;
+  float pitch;
+  float yaw;
+};
+IMUData imu;
+
+struct GPSData{
+  float lat;
+  float lon;
+};
+GPSData gpsdata;
+
+// ================= MODEM POWER =================
+// void powerOnModem() {
+//   pinMode(MODEM_PWRKEY, OUTPUT);
+//   digitalWrite(MODEM_PWRKEY, HIGH);
+//   delay(1500);
+//   digitalWrite(MODEM_PWRKEY, LOW);
+//   delay(8000);
+// }
+
+// ================= RAW AT HELPER =================
+String sendATRaw(String cmd, unsigned long timeout) {
+  String res = "";
+  SerialMon.println();
+  SerialMon.print("SEND: ");
+  SerialMon.println(cmd);
+  while (SerialAT.available()) SerialAT.read();
+  SerialAT.println(cmd);
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    while (SerialAT.available()) {
+      char c = SerialAT.read();
+      res += c;
+    }
+  }
+  SerialMon.print(res);
+  return res;
+}
+
+// ================= WAIT SIM READY =================
+bool waitSIMReadyAT() {
+  for (int i = 0; i < 20; i++) {
+    String res = sendATRaw("AT+CPIN?", 3000);
+    if (res.indexOf("+CPIN: READY") >= 0) return true;
+    SerialMon.println("SIM belum ready, tunggu...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+  return false;
+}
+
+// ================= DISABLE GPS =================
+void disableGPS() {
+  SerialMon.println("Disable GPS/NMEA...");
+  sendATRaw("AT+CGPS=0", 3000);
+  sendATRaw("AT+CGPSINFOCFG=0,0", 3000);
+  sendATRaw("AT+CGPSNMEA=0", 3000);
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  while (SerialAT.available()) SerialAT.read();
+}
+
+//================= ENABLE GPS =================
+void enableGPS() {
+     // === FIX untuk SIM7600G ===
+    modem.sendAT("+CGPS=0");           // pastikan GPS dimatikan dulu
+    modem.waitResponse(2000);
+
+    // modem.sendAT("+CGNSSMODE=15,1");   // mode GNSS: GPS + GLONASS + Galileo + BeiDou
+    // modem.waitResponse(2000);
+
+    // modem.sendAT("+CGPSNMEA=200191");  // aktifkan format NMEA standar
+    // modem.waitResponse(2000);  // (non aktifin sementara utk dicoba biar ga rebutan serial AT)
+
+    // modem.sendAT("+CGPSNMEARATE=10");   // 1Hz update rate
+    // modem.waitResponse(2000);
+
+    // modem.sendAT("+CGPSINFOCFG=0,0"); // stop ngespam
+    // modem.waitResponse(2000);
+
+    modem.sendAT("+CGPS=1");           // aktifkan GPS (gunakan 1 parameter saja!)
+    if (modem.waitResponse(3000) == 1) {
+        Serial.println("GPS powered ON successfully.");
+    } else {
+        Serial.println("Failed to power ON GPS.");
+    }
+
+}
+
+// ================= NETWORK SETUP =================
+bool setupModemNetwork() {
+  SerialMon.println("Init modem...");
+  if (!modem.init()) {
+    SerialMon.println("Modem init gagal.");
+    return false;
+  }
+  // disableGPS();
+  SerialMon.println("Cek SIM...");
+  if (!waitSIMReadyAT()) return false;
+
+  SerialMon.println("Tunggu network Telkomsel...");
+  if (!modem.waitForNetwork(90000L)) return false;
+
+  SerialMon.println("Connect GPRS Telkomsel...");
+  if (!modem.isGprsConnected()) {
+    if (!modem.gprsConnect(apn, gprsUser, gprsPass)) return false;
+  }
+
+  enableGPS();
+
+  SerialMon.print("Modem IP: ");
+  SerialMon.println(modem.localIP());
+  
+  return true;
+}
+
+// ================= MQTT CONNECT =================
+void connectMQTT() {
+  SerialMon.println();
+  SerialMon.println("Connect MQTT...");
+
+  while (!mqtt.connected()) {
+    SerialMon.print("Connecting to broker: ");
+    SerialMon.println(mqttServer);
+
+    String clientId = String(mqttClientId) + "_" + String(random(1000, 9999));
+
+    if (mqtt.connect(clientId.c_str())) {
+      SerialMon.println("MQTT CONNECT BERHASIL");
+    } else {
+      SerialMon.print("MQTT CONNECT GAGAL, state=");
+      SerialMon.println(mqtt.state());
+      vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+  }
+}
+
+// ================= GPS READ =================
+bool gpsRead(){
+  float lat,lon;
+  if (modem.getGPS(&lat, &lon)){
+    gpsdata.lat = lat;
+    gpsdata.lon = lon;
+    return true;
+  }
+  return false;
+}
+
+// ================= NEXTION HELPER =================
+void sendNextion(String cmd) {
+  NEXTION_SERIAL.print(cmd);
+  NEXTION_SERIAL.write(0xFF);
+  NEXTION_SERIAL.write(0xFF);
+  NEXTION_SERIAL.write(0xFF);
+}
+
+void setValue(String signal, int value){
+  sendNextion(signal + ".val=" + String(value));
+}
+
+void setPicture(String signal, int pic){
+  sendNextion(signal + ".pic=" + String(pic));
+}
+
+void handleNextionInput() {
+  // while (NEXTION_SERIAL.available()) {
+  //   Serial.print("RAW: 0x");
+  //   Serial.println(NEXTION_SERIAL.read(), HEX);
+  // }
+
+  while (NEXTION_SERIAL.available() >= 3) {
+    if (NEXTION_SERIAL.read() == 0xAA) { 
+      uint8_t fuseID_Key = NEXTION_SERIAL.read();
+      uint8_t fuseValue = NEXTION_SERIAL.read();
+
+      switch (fuseID_Key) {
+      case 0xA1: // Reset VCU
+        SerialMon.println("Nextion Req: Reset VCU");
+        sendCommandToPDSM(8, fuseValue);
+        break;
+        
+      case 0xA2: // Reset BSPD_PWSTG
+        SerialMon.println("Nextion Req: Reset BSPD_PWSTG");
+        sendCommandToPDSM(7, fuseValue);
+        break;
+
+      case 0xA3: // Reset TSMB
+        SerialMon.println("Nextion Req: Reset TSMB");
+        sendCommandToPDSM(6, fuseValue);
+        break; 
+
+      case 0xA4: // Reset IMD
+        SerialMon.println("Nextion Req: Reset IMD");
+        sendCommandToPDSM(5, fuseValue);
+        break; 
+
+      case 0xA5: // Reset ACCINT
+        SerialMon.println("Nextion Req: Reset ACCINT");
+        sendCommandToPDSM(4, fuseValue);
+        break;
+
+      case 0xA7: // Reset EM
+        SerialMon.println("Nextion Req: Reset EM");
+        sendCommandToPDSM(2, fuseValue);
+        break;
+
+      case 0xA8: // Reset MC
+        SerialMon.println("Nextion Req: Reset MC");
+        sendCommandToPDSM(1, fuseValue);
+        break;
+      }
+    }
+  }
+}
+
+// ================= CAN BUS HANDLER =================
+void HandleRSMSensor(const CAN_message_t &msg){
+  sensor.regID = msg.buf[0];
+
+  if (sensor.regID == 0x00){
+    sensor.susTravelRL = map(msg.buf[1],0,255,0,100);
+    sensor.susTravelRR = map(msg.buf[2],0,255,0,100);
+    sensor.rpmRL_lsb = msg.buf[3];
+    sensor.rpmRL_msb = msg.buf[4];
+    sensor.rpmRR_lsb = msg.buf[5];
+    sensor.rpmRR_msb = msg.buf[6];
+
+    sensor.rpmRL = (int16_t) (msg.buf[4] << 8) | msg.buf[3];
+    sensor.rpmRR = (int16_t) (msg.buf[6] << 8) | msg.buf[5];
+  }
+
+  else if (sensor.regID == 0x01){
+    sensor.tempRSM = msg.buf[1];
+    sensor.currentLV = (int16_t) (msg.buf[4] << 8) | msg.buf[3];
+    sensor.voltageLV = (int16_t) (msg.buf[6] << 8) | msg.buf[5];
+    sensor.currentLV_lsb = msg.buf[3];
+    sensor.currentLV_msb = msg.buf[4];
+    sensor.voltageLV_lsb = msg.buf[5];
+    sensor.voltageLV_msb = msg.buf[6];
+
+  }
+}
+
+void HandleBMS(const CAN_message_t &msg){
+  bms.regID = msg.buf[0];
+  if (bms.regID == 0x06){
+    bms.currentHV = ((uint16_t) (msg.buf[1] << 8) | msg.buf[2]);
+    // bms.currentHVRatusan = msg.buf[1];
+    // bms.currentHVPuluhan = msg.buf[2];
+    // bms.currentHV = (bms.currentHVRatusan * 10) + bms.currentHVPuluhan;
+
+  }
+  else if (bms.regID == 0x07){
+    // bms.tempHVBat = (print_tempHVA + print_tempHVB) / 2.0f;
+    print_tempHVA = (float) (msg.buf[2]+msg.buf[3]+msg.buf[4])/3;
+  }
+    else if (bms.regID == 0x08){
+    print_tempHVB = (float) (msg.buf[1] + msg.buf[2]+msg.buf[3]+msg.buf[4])/4;
+  }
+  // else if (bms.regID == 0x07){
+  //   bms.avgTemp_A = (msg.buf[1] + msg.buf[2] + msg.buf[3] + msg.buf[4])/4;
+  // }
+  // else if (bms.regID == 0x08){
+  //   bms.avgTemp_B = (msg.buf[1] + msg.buf[2] + msg.buf[3] + msg.buf[4])/4;
+  // }
+  // else if (bms.regID == 0x09){
+  //   bms.voltageHVBat =(msg.buf[1] + msg.buf[2] + msg.buf[3] + msg.buf[4])*24/10;
+  // }
+  else if(bms.regID == 0x15){
+    bms.vtotalHVA = ((msg.buf[1] << 24) | (msg.buf[2] << 16) | (msg.buf[3] << 8) | msg.buf[4])/100;
+    // bms.vtotalHVA = (uint16_t) (msg.buf[1] << 8) | msg.buf[2];
+  }
+  else if(bms.regID == 0x16){
+    bms.vtotalHVB = ((msg.buf[1] << 24) | (msg.buf[2] << 16) | (msg.buf[3] << 8) | msg.buf[4])/100;
+    // bms.vtotalHVB = (uint16_t) (msg.buf[1] << 8) | msg.buf[2];
+  }
+  // bms.tempHVBat = (bms.avgTemp_A + bms.avgTemp_B)/2;
+  print_arusHV = bms.currentHV/10.0f;
+  print_teganganHV = bms.vtotalHV/100.0f;
+  print_tempHV = (print_tempHVA + print_tempHVB) / 2;
+  bms.tempHVBat = print_tempHVA; 
+  bms.vtotalHV = bms.vtotalHVA+bms.vtotalHVB;
+  motor.kw =  print_teganganHV * print_arusHV;
+}
+
+void HandleTesting(const CAN_message_t &msg){
+  sensor.apps = msg.buf[0];
+  sensor.bse = msg.buf[1];
+  sensor.statusbit = msg.buf[2];
+  sensor.rpmbamo = (int16_t) (msg.buf[5] << 8) | msg.buf[4];
+  sensor.rpm = (uint16_t) (map(sensor.rpmbamo, 0, 32767, 0, 6500));
+
+  kph = sensor.rpm * 173.3f * 0.0006f;
+
+  motor.errorBAMO = (uint16_t) (msg.buf[7] << 8) | msg.buf[6];
+
+  // bool lock = (millis() - lastCmdTime < CmdTime);
+
+  // Serial.print("PDSM fuse: ");
+  // Serial.print(msg.buf[3], BIN);
+  // Serial.print(" | lock: ");
+  // Serial.println(lock);
+
+  // if (!lock){
+  //   sensor.fuse = msg.buf[3];
+    //  fuseVal = ~msg.buf[3];
+  // }
+  //   if (!lock){
+  //   if (msg.buf[3] == (uint8_t)~fuseVal){
+  //     sensor.fuse = msg.buf[3];
+  //   } else {
+  //     lastCmdTime = millis();
+  //   }
+  // }
+
+  if (cmdPending){
+    if (millis() - lastCmdTime > 3000){
+        cmdPending = false;
+        sensor.fuse = msg.buf[3];
+        fuseVal = ~msg.buf[3];
+        return;
+      }
+    if (msg.buf[3] == (uint8_t)~fuseVal){
+        sensor.fuse = msg.buf[3];
+        fuseVal = ~msg.buf[3];
+        cmdPending = false;
+      }
+  } 
+  else {
+      sensor.fuse = msg.buf[3];
+      fuseVal = ~msg.buf[3];
+  }
+}
+
+
+
+void HandleVCU2(const CAN_message_t &msg){
+  sensor.susTraveFL = msg.buf[0];
+  sensor.susTraveFR = msg.buf[1];
+  motor.suhuMotor = msg.buf[2];
+  motor.suhuIGBT = msg.buf[3];
+  motor.arus = (int16_t) (msg.buf[5] << 8) | msg.buf[4];
+  motor.tegangan = (int16_t) (msg.buf[7] << 8) | msg.buf[6];
+}
+
+void HandleIMU(const CAN_message_t &msg){
+    uint8_t reg_id = msg.buf[0];
+    int16_t raw1 = (msg.buf[1] << 8) | msg.buf[2];
+    int16_t raw2 = (msg.buf[3] << 8) | msg.buf[4];
+    int16_t raw3 = (msg.buf[5] << 8) | msg.buf[6];
+
+    if(reg_id == 0x02){
+      imu.ax = (float)raw1/100;
+      imu.ay = (float)raw2/100;
+      imu.az = (float)raw3/100;
+    }
+    else if(reg_id == 0x03){
+      imu.gx = (float)raw1/100;
+      imu.gy = (float)raw2/100;
+      imu.gz = (float)raw3/100;
+    }
+    else if(reg_id == 0x04){
+      imu.mx = (float)raw1/100;
+      imu.my = (float)raw2/100;
+      imu.mz = (float)raw3/100;
+    }
+    else if(reg_id == 0x05){
+      imu.pitch = (float)raw1/100;
+      imu.roll = (float)raw2/100;
+      imu.yaw = (float)raw3/100;
+    }
+}
+  
+void onReceive(const CAN_message_t &msg){
+  if (msg.id == 0x10)HandleRSMSensor(msg);
+  if(msg.id == 6) HandleTesting(msg);
+  if (msg.id == 7) HandleVCU2(msg);
+  if(msg.id == 0x11) HandleIMU(msg);
+  if(msg.id == 0x12) HandleBMS(msg);
+}
+
+void sendCommandToPDSM(uint8_t fuseID, uint8_t action) {
+ if(action == 1){
+  bitClear(fuseVal, fuseID - 1);
+  bitSet(sensor.fuse, fuseID - 1); 
+ }
+ else{
+  bitSet(fuseVal, fuseID - 1);
+  bitClear(sensor.fuse, fuseID - 1);
+ }
+
+ lastCmdTime = millis();
+ cmdPending = true;
+ 
+  CAN_message_t msg;
+  msg.id = ID_NEXTION;
+  msg.len = 1;
+  msg.buf[0] = fuseVal;
+  // msg.buf[1] = 0;
+  // msg.buf[2] = 0;
+  // msg.buf[3] = 0;
+  // msg.buf[4] = 0;
+  // msg.buf[5] = 0;
+  // msg.buf[6] = 0;
+  // msg.buf[7] = 0; 
+  Can0.write(msg);
+  vTaskDelay(pdMS_TO_TICKS(10));
+  Can0.write(msg);
+  SerialMon.println("CAN Command Sent to PDSM");
+  Serial.print("ID 0x13: ");
+  Serial.println(fuseVal, BIN);
+}
+
+// ================= NEXTION DISPLAY =================
+
+void displayRSMSensor(){
+  setValue("v_lvbat", sensor.voltageLV);
+  setValue("a_lvbat", sensor.currentLV);
+}
+
+void dipslayBMSData(){
+  setValue("v_bat", bms.vtotalHV);
+  setValue("a_bat", bms.currentHV);
+  setValue("tem_bat", bms.tempHVBat);
+}
+
+void displayTesting(){
+  setValue("n_apps", sensor.apps);
+  setValue("h_apps", sensor.apps);
+  setValue("n_bse", sensor.bse);
+  setValue("h_bse", sensor.bse);
+  setValue("h_rpm", sensor.rpm);
+  setValue("n_rpm", sensor.rpm);
+  setValue("speed", kph);
+  setValue("v_mtr", motor.tegangan);
+  setValue("a_mtr", motor.arus);
+  setValue("tem_mtr", motor.suhuMotor);
+  setValue("tem_igbt", motor.suhuIGBT);
+  setValue("kw", motor.kw);
+
+  setValue("run", bitRead(sensor.statusbit, 0));
+  setValue("rfe", bitRead(sensor.statusbit, 1));
+  setValue("trq0", bitRead(sensor.statusbit, 2));
+
+  setValue("mc", bitRead(sensor.fuse, 0));
+  setValue("em", bitRead(sensor.fuse, 1));
+  setValue("rsm", bitRead(sensor.fuse, 2));
+  setValue("accint", bitRead(sensor.fuse, 3));
+  setValue("imd", bitRead(sensor.fuse, 4));
+  setValue("tsmb", bitRead(sensor.fuse, 5));
+  setValue("bspd_pwstg", bitRead(sensor.fuse, 6));
+  setValue("vcu", bitRead(sensor.fuse, 7));
+}
+
+void displayIMU(){
+  float limitedRoll = constrain(imu.roll, -65.0 , 65.0);
+  float limitedPitch = constrain(imu.pitch, -20.0 , 20.0);
+  int roll_nextion = map(limitedRoll*100, -6500, 6500, 82, 212);
+  int pitch_nextion = map(limitedPitch*100, -2000, 2000, 213, 253);
+
+  setPicture("pitch", pitch_nextion);
+  setPicture("roll", roll_nextion);
+}
+
+void printMonitor(){
+    // Serial.println("============= VCU DATA =============");
+    // Serial.print("APPS: ");
+    // Serial.print(sensor.apps);
+    // Serial.println();
+    // Serial.print("        HVA ");
+    // Serial.println(bms.vtotalHVA);
+    // Serial.print("        HVB: ");
+    // Serial.println(bms.vtotalHVB);
+    // Serial.print("        AEUS BMS: ");
+    // Serial.println(print_arusHV);
+    // Serial.print("        ARUSHV: ");
+    // Serial.println(print_arusHV);
+    //     Serial.print("        tempHV: ");
+    // Serial.println(print_tempHV);
+    // Serial.print("        BsuhuHV: ");
+    // Serial.println(print_tempHVB);
+    // Serial.print("        rpmRRlsb: ");
+    // Serial.println(sensor.rpmRR_lsb);
+    // Serial.print("        rpmRLmsb: ");
+    // Serial.println(sensor.rpmRL_msb);
+    // Serial.print("        rpmRLlsb: ");
+    // Serial.println(sensor.rpmRL_lsb);
+    // Serial.print("        rpmRR: ");
+    // Serial.println(sensor.rpmRR);
+    // Serial.print("        rpmRL: ");
+    // Serial.println(sensor.rpmRL);
+    // Serial.print("        voltageLSB: ");
+    // Serial.println(sensor.voltageLV_lsb);
+    // Serial.print("        voltageMSB: ");
+    // Serial.println(sensor.voltageLV_msb);
+    // Serial.println();
+    // Serial.print("run: ");
+    // Serial.print(bitRead(sensor.statusbit, 0));
+    // Serial.println();    
+    // Serial.print("rfe: ");
+    // Serial.print(bitRead(sensor.statusbit, 1));a
+    // Serial.println();    
+    // Serial.print("trq0: ");
+    // Serial.print(bitRead(sensor.statusbit, 2));
+    // Serial.println();    
+    // Serial.print("vcu: ");
+    // Serial.print(bitRead(sensor.fuse, 0));
+    // Serial.println();
+    // Serial.print("bspd_pwstg: ");
+    // Serial.print(bitRead(sensor.fuse, 1));
+    // Serial.println();
+    // Serial.print("tsmb: ");
+    // Serial.print(bitRead(sensor.fuse, 2));
+    // Serial.println();
+    // Serial.print("imd: ");
+    // Serial.print(bitRead(sensor.fuse, 3));
+    // Serial.println();
+    // Serial.print("aaccint: ");
+    // Serial.println(bitRead(sensor.fuse, 4));
+
+    // Serial.print("rsm: ");
+    // Serial.println(bitRead(sensor.fuse, 5));
+
+    // Serial.print("em: ");
+    // Serial.println(bitRead(sensor.fuse, 6));
+
+    // Serial.print("mc: ");
+    // Serial.println(bitRead(sensor.fuse, 7));
+
+
+    // Serial.println("============= IMU DATA =============");
+    // Serial.print("ax: ");
+    // Serial.println(imu.ax);
+    // Serial.print("ay: ");
+    // Serial.println(imu.ay);
+    // Serial.print("az: ");
+    // Serial.println(imu.az);
+    
+    // Serial.print("gx: ");
+    // Serial.println(imu.gx);
+    // Serial.print("gy: ");
+    // Serial.println(imu.gy);
+    // Serial.print("gz: ");
+    // Serial.println(imu.gz);
+
+    // Serial.print("roll: ");
+    // Serial.println(imu.roll);
+    // Serial.print("pitch: ");
+    // Serial.println(imu.pitch);
+
+    // Serial.println("============= BMS DATA =============");
+    // Serial.print("                    HVVoltage: ");
+    // Serial.println(bms.voltageHVBat);
+    // Serial.print("HVCurrent: ");
+    // Serial.println(bms.currentHV);
+    // Serial.print("HVTemp: ");
+    // Serial.println(bms.tempHVBat);
+}
+
+// ================= SETUP =================
+TaskHandle_t nextion, telem, gpstask;
+
+void NextionTaskHandler(void *parameters){
+  for(;;){
+    unsigned long currentMillis = millis();
+    if(currentMillis - lastNextionUpdate > NEXTION_UPDATE_INTERVAL){
+      lastNextionUpdate = currentMillis;
+
+      handleNextionInput();
+      displayTesting();
+      displayIMU();
+      dipslayBMSData();
+      displayRSMSensor();
+      // printMonitor();
+    }
+
+    // vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+
+void MqttTaskHandler(void *parameters){
+
+  randomSeed(micros());
+
+  if(!setupModemNetwork()) {
+    SerialMon.println("Setup network gagal. Restart ESP32.");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    ESP.restart(); // Otomatis restart jika gagal
+  }
+
+  mqtt.setServer(mqttServer, mqttPort);
+  mqtt.setBufferSize(1024);
+  mqtt.setKeepAlive(60);
+  mqtt.setSocketTimeout(30);
+
+  connectMQTT();
+
+  for(;;){
+    if (!modem.isNetworkConnected()) {
+      SerialMon.println("Network putus, tunggu reconnect...");
+      modem.waitForNetwork(60000L);
+    }
+    if (!modem.isGprsConnected()) {
+      SerialMon.println("GPRS putus, reconnect...");
+      modem.gprsConnect(apn, gprsUser, gprsPass);
+    }
+    if (!mqtt.connected()) {
+      connectMQTT();
+    }
+    
+    mqtt.loop();
+
+    if (millis() - lastGpsPoll >= GPS_INTERVAL){
+      lastGpsPoll = millis();
+
+      gpsRead();
+    }
+
+    String payload = "{";
+    payload += "\"apps\":" + String(sensor.apps) + ",";
+    payload += "\"bse\":" + String(sensor.bse) + ",";
+    payload += "\"fuse\":" + String(sensor.fuse) + ",";
+    payload += "\"statusbit\":" + String(sensor.statusbit) + ",";
+
+    payload += "\"rpm_rl\":" + String(sensor.rpmRL) + ",";
+    payload += "\"rpm_rr\":" + String(sensor.rpmRR) + ",";
+    payload += "\"rpm\":" + String(sensor.rpm) + ",";
+
+    payload += "\"roll\":"    + String(imu.roll,2)  + ",";
+    payload += "\"pitch\":"   + String(imu.pitch,2) + ",";
+    payload += "\"yaw\":"     + String(imu.yaw,2)   + ",";
+
+    payload += "\"lat\":"     + String(gpsdata.lat, 6)  + ",";
+    payload += "\"lng\":"     + String(gpsdata.lon, 6)  + ",";
+    payload += "\"speed\":"   + String(kph) + ",";
+    payload += "\"heading\":" + String(imu.yaw,2) + ",";
+    payload += "\"altitude\":" + String(0) + ",";
+
+    payload += "\"sus_travel_rl\":" + String(sensor.susTravelRL) + ",";
+    payload += "\"sus_travel_rr\":" + String(sensor.susTravelRR) + ",";
+    payload += "\"sus_travel_fl\":" + String(sensor.susTraveFL) + ",";
+    payload += "\"sus_travel_fr\":" + String(sensor.susTraveFR) + ",";
+
+    payload += "\"v_motor\":" + String(motor.tegangan) + ",";
+    payload += "\"i_motor\":" + String(motor.arus) + ",";
+    payload += "\"suhu_motor\":" + String(motor.suhuMotor) + ",";
+    payload += "\"suhu_igbt\":" + String(motor.suhuIGBT) + ",";
+    payload += "\"error_bamo\":" + String(motor.errorBAMO) + ",";
+    payload += "\"kwh\":" + String(motor.kw) + ",";
+
+    payload += "\"lv_current\":" + String(sensor.currentLV) + ",";
+    payload += "\"lv_voltage\":" + String(sensor.voltageLV) + ",";
+    payload += "\"hv_current\":" + String(bms.currentHV) + ",";
+    payload += "\"hv_voltage\":" + String(bms.vtotalHV) + ",";
+    payload += "\"hv_temp\":" + String(bms.tempHVBat);
+    payload += "}";
+
+    unsigned long now = millis();
+
+    if(now - lastMqttPublish > MQTT_PUBLISH_INTERVAL) {
+      lastMqttPublish = now;
+      SerialMon.print("Publishing to MQTT... ");
+      if (mqtt.publish(mqttTopic, payload.c_str())) {
+        SerialMon.println("OK");
+      } 
+      else {
+        SerialMon.println("GAGAL");
+        SerialMon.println(mqtt.state());
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  SerialMon.begin(115200); // Gunakan 115200 agar seragam dan cepat
+  delay(100);
+  NEXTION_SERIAL.setRxBufferSize(256);
+  NEXTION_SERIAL.setTxBufferSize(256);
+  NEXTION_SERIAL.begin(115200, SERIAL_8N1, NEXTION_RX, NEXTION_TX);
+  delay(100);
+  SerialAT.setRxBufferSize(1024);
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(100);
+
+  Can0.onReceive(onReceive);
+  Can0.setRX(CAN_RX);
+  Can0.setTX(CAN_TX); 
+  Can0.begin();
+  Can0.setBaudRate(500000);
+
+  xTaskCreatePinnedToCore(NextionTaskHandler, "Nextion", 10000, NULL, 0, &nextion, 0);
+  xTaskCreatePinnedToCore(MqttTaskHandler, "Telem", 10000, NULL, 0, &telem, 1);
+
+}
+
+// ================= LOOP =================
+void loop()
+{
+// atas nama mas tg mas ghoz mas oki mbak naya
+}
