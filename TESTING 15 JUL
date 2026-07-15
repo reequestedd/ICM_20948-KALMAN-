@@ -48,10 +48,10 @@ uint8_t fuseVal = 0xFF;
 bool cmdPending = false;
 
 uint32_t lastMqttPublish = 0;
-const uint16_t MQTT_PUBLISH_INTERVAL = 10; 
+const uint16_t MQTT_PUBLISH_INTERVAL = 50; 
 
 uint32_t lastGpsPoll = 0;
-const uint16_t GPS_INTERVAL = 1000; // 1 Hz
+const uint16_t GPS_INTERVAL = 1000; // 2 Hz
 
 TinyGPSPlus gps;
 TinyGsm modem(SerialAT);
@@ -65,6 +65,16 @@ float print_teganganHV;
 float print_tempHVA;
 float print_tempHVB;
 float print_tempHV;
+
+struct MQTTFloatData{
+  float teganganHV;
+  float arusHV;
+  float teganganLV;
+  float arusLV;
+  float teganganMotor;
+  float arusMotor;
+};
+MQTTFloatData mq;
 
 struct RSMSensorData{
   uint8_t  regID;         
@@ -376,6 +386,10 @@ void HandleRSMSensor(const CAN_message_t &msg){
     sensor.voltageLV_msb = msg.buf[6];
 
   }
+
+  mq.arusLV = (float) sensor.currentLV/10;
+  mq.teganganLV = (float) sensor.voltageLV/100;
+
 }
 
 void HandleBMS(const CAN_message_t &msg){
@@ -389,10 +403,10 @@ void HandleBMS(const CAN_message_t &msg){
   }
   else if (bms.regID == 0x07){
     // bms.tempHVBat = (print_tempHVA + print_tempHVB) / 2.0f;
-    bms.avgTemp_A = msg.buf[1];
+    bms.avgTemp_A = (msg.buf[1])/3;
   }
     else if (bms.regID == 0x08){
-    bms.avgTemp_B = msg.buf[1];
+    bms.avgTemp_B = (msg.buf[1])/4;
   }
   // else if (bms.regID == 0x07){
   //   bms.avgTemp_A = (msg.buf[1] + msg.buf[2] + msg.buf[3] + msg.buf[4])/4;
@@ -415,13 +429,13 @@ void HandleBMS(const CAN_message_t &msg){
   print_arusHV = bms.currentHV/10.0f;
   print_teganganHV = bms.vtotalHV/100.0f;
   print_tempHV = (bms.avgTemp_A+bms.avgTemp_B) / 2;
-  bms.tempHVBat = (bms.avgTemp_A+bms.avgTemp_B) / 8 ; 
+  bms.tempHVBat = (bms.avgTemp_A+bms.avgTemp_B)/2 ; 
   bms.vtotalHV = bms.vtotalHVA+bms.vtotalHVB;
   motor.kw =  print_teganganHV * print_arusHV;
-  bms.mqttVoltHV = (bms.vtotalHVA+bms.vtotalHVB)/10;
-  bms.mqttCurHV = bms.currentHV/10;
+  mq.teganganHV= (float) bms.vtotalHV/10;
+  mq.arusHV = (float) bms.currentHV/10;
 }
-`
+
 void HandleTesting(const CAN_message_t &msg){
   sensor.apps = msg.buf[0];
   sensor.bse = msg.buf[1];
@@ -429,7 +443,7 @@ void HandleTesting(const CAN_message_t &msg){
   sensor.rpmbamo = (int16_t) (msg.buf[5] << 8) | msg.buf[4];
   sensor.rpm = (uint16_t) (map(sensor.rpmbamo, 0, 32767, 0, 6500));
 
-  kph = sensor.rpm * 173.3f * 0.0006f;
+  kph = sensor.rpm/4.7f * 173.3f * 0.0006f;
 
   motor.errorBAMO = (uint16_t) (msg.buf[7] << 8) | msg.buf[6];
 
@@ -471,8 +485,6 @@ void HandleTesting(const CAN_message_t &msg){
   }
 }
 
-
-
 void HandleVCU2(const CAN_message_t &msg){
   sensor.susTraveFL = msg.buf[0];
   sensor.susTraveFR = msg.buf[1];
@@ -480,6 +492,7 @@ void HandleVCU2(const CAN_message_t &msg){
   motor.suhuIGBT = msg.buf[3];
   motor.arus = (int16_t) (msg.buf[5] << 8) | msg.buf[4];
   motor.tegangan = ((int16_t) (msg.buf[7] << 8) | msg.buf[6])*300/1650;
+  mq.teganganMotor = (float) motor.tegangan / 10;
 }
 
 void HandleIMU(const CAN_message_t &msg){
@@ -606,10 +619,10 @@ void printMonitor(){
     // Serial.print("APPS: ");
     // Serial.print(sensor.apps);
     // Serial.println();
-    // Serial.print("        HVA ");
-    // Serial.println(bms.vtotalHVA);
-    // Serial.print("        HVB: ");
-    // Serial.println(bms.vtotalHVB);
+    Serial.print("        TEMPA ");
+    Serial.println(bms.avgTemp_A);
+    Serial.print("        TEMPB: ");
+    Serial.println(bms.avgTemp_B);
     // Serial.print("        AEUS BMS: ");
     // Serial.println(print_arusHV);
     // Serial.print("        ARUSHV: ");
@@ -784,17 +797,17 @@ void MqttTaskHandler(void *parameters){
     payload += "\"sus_travel_fl\":" + String(sensor.susTraveFL) + ",";
     payload += "\"sus_travel_fr\":" + String(sensor.susTraveFR) + ",";
 
-    payload += "\"v_motor\":" + String(motor.tegangan) + ",";
+    payload += "\"v_motor\":" + String(mq.teganganMotor,1) + ",";
     payload += "\"i_motor\":" + String(motor.arus) + ",";
     payload += "\"suhu_motor\":" + String(motor.suhuMotor) + ",";
     payload += "\"suhu_igbt\":" + String(motor.suhuIGBT) + ",";
     payload += "\"error_bamo\":" + String(motor.errorBAMO) + ",";
     payload += "\"kwh\":" + String(motor.kw) + ",";
 
-    payload += "\"lv_current\":" + String(sensor.currentLV) + ",";
-    payload += "\"lv_voltage\":" + String(sensor.voltageLV) + ",";
-    payload += "\"hv_current\":" + String(bms.mqttCurHV) + ",";
-    payload += "\"hv_voltage\":" + String(bms.mqttVoltHV) + ",";
+    payload += "\"lv_current\":" + String(mq.arusLV,1) + ",";
+    payload += "\"lv_voltage\":" + String(mq.teganganLV,2) + ",";
+    payload += "\"hv_current\":" + String(mq.arusHV,1) + ",";
+    payload += "\"hv_voltage\":" + String(mq.teganganHV,1) + ",";
     payload += "\"hv_temp\":" + String(bms.tempHVBat);
     payload += "}";
 
